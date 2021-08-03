@@ -316,6 +316,22 @@ def activate_and_scale_surface_correlation(
 
 
 def add_ministeps(user_config, ert_param_dict, ert):
+    """
+    This is the main function setting up the localisation for an ERT instance.
+    Input:
+              user_config: Configuration object with user specified localisation setup.
+              ert_param_dict:  Dict of parameter nodes and associated parameters defined
+                                           for the ERT instance.
+              ert: The ERT instance.
+    Result:
+    The result is to add a user-specified number of ministeps to an update step.
+    Each ministep specify a set of model parameters and a set of observations
+    and that there should be correlations between them. By selecting which
+    parameters to correlate to which observations, it is possible to restrict the
+    correlations and avoid unwanted or unrealistic correlations. When this is done
+    prior to the first analysis step in ERT Ensemble Smoother algorithm, the specified
+    localisation restrictions will be used.
+    """
     # pylint: disable-msg=too-many-branches
     local_config = ert.getLocalConfig()
     updatestep = local_config.getUpdatestep()

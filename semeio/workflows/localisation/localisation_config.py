@@ -381,8 +381,10 @@ class LocalisationConfig(BaseModel):
 
     @validator("correlations")
     def validate_correlations(cls, correlations, values):
-
         for corr in correlations:
+            use_field_parameter = False
+            use_surface_parameter = False
+
             if len(corr.obs_group.add) == 0:
                 raise ValueError(
                     "Number of specified observations for correlation: "
@@ -415,6 +417,42 @@ class LocalisationConfig(BaseModel):
             # by the 2D grid defined for the surface.
             check_validation_of_ref_point_for_surface(corr, node_type_dict, values)
 
+            # Check if any parameter node is a field
+            use_field_parameter = has_parameter_of_type(
+                corr, node_type_dict, ErtImplType.FIELD
+            )
+            if not use_field_parameter and corr.field_scale is not None:
+                key = "field_scale"
+                raise KeyError(
+                    f"Keyword {key} is specified, "
+                    f"but no parameter node are of type FIELD for {corr.name}"
+                )
+            if use_field_parameter and corr.field_scale is None:
+                key = "field_scale"
+                debug_print(
+                    "Warning: No scaling is specified for field parameters in "
+                    f"correlation group {corr.name}",
+                    LogLevel.LEVEL2,
+                )
+
+            # Check if any parameter node is a surface
+            use_surface_parameter = has_parameter_of_type(
+                corr, node_type_dict, ErtImplType.SURFACE
+            )
+            if not use_surface_parameter and corr.surface_scale is not None:
+                key = "surface_scale"
+                raise KeyError(
+                    f"Keyword {key} is specified, "
+                    f"but no parameter node are of type SURFACE for {corr.name}"
+                )
+            if use_surface_parameter and corr.surface_scale is None:
+                key = "surface_scale"
+                debug_print(
+                    "Warning: No scaling is specified for surface parameters in "
+                    f"correlation group {corr.name}",
+                    LogLevel.LEVEL2,
+                )
+
         number_of_duplicates = check_for_duplicated_correlation_specifications(
             correlations
         )
@@ -425,6 +463,15 @@ class LocalisationConfig(BaseModel):
             )
 
         return correlations
+
+
+def has_parameter_of_type(corr, node_type_dict, parameter_type):
+    params_dict = corr.param_group.add
+    param_type_found = False
+    for node_name, param_list in params_dict.items():
+        if node_type_dict[node_name] == parameter_type:
+            param_type_found = True
+    return param_type_found
 
 
 def check_observation_specification(obs_group, ert_obs_list):

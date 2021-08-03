@@ -192,9 +192,20 @@ def test_localisation_surf(
     LocalisationConfigJob(ert).run("local_config.yaml")
 
 
-def test_localisation_field(
-    setup_poly_ert,
-):
+@pytest.mark.parametrize(
+    "param_group_add, param_group_remove",
+    [
+        (
+            ["G"],
+            ["C*"],
+        ),
+        (
+            ["*"],
+            ["C*"],
+        ),
+    ],
+)
+def test_localisation_field(setup_poly_ert, param_group_add, param_group_remove):
     nreal = 20
     nx = 20
     ny = 10
@@ -244,7 +255,8 @@ def test_localisation_field(
                     "add": "*",
                 },
                 "param_group": {
-                    "add": "*",
+                    "add": param_group_add,
+                    "remove": param_group_remove,
                 },
                 "ref_point": [700, 370],
                 "field_scale": {
