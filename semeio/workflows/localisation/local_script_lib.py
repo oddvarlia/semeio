@@ -1,42 +1,95 @@
 # pylint: disable=W0201
-import yaml
 import math
+import yaml
 import cwrap
 import numpy as np
 
+from collections import defaultdict
+from typing import List
+from dataclasses import dataclass, field
+
 from ecl.util.geometry import Surface
+from ecl.eclfile import Ecl3DKW
+from ecl.ecl_type import EclDataType
 from res.enkf.enums.ert_impl_type_enum import ErtImplType
 from res.enkf.enums.enkf_var_type_enum import EnkfVarType
-from dataclasses import dataclass
 
 from semeio.workflows.localisation.localisation_debug_settings import (
     LogLevel,
     debug_print,
 )
-import semeio.workflows.localisation.localisation_debug_settings as log_level_setting
-
-# The global variables are only used for controlling output of log info to screen
-# and for writing scaling factor to file (for QC and test purpose)
-debug_level = log_level_setting.debug_level
-scaling_parameter_number = log_level_setting.scaling_parameter_number
 
 
-def get_observations_from_ert(ert):
-    # Get list of observation nodes from ERT config to be used in consistency check
-    ert_obs = ert.getObservations()
-    obs_data_from_ert_config = ert_obs.getAllActiveLocalObsdata()
-    ert_obs_node_list = []
-    for obs_node in obs_data_from_ert_config:
-        node_name = obs_node.key()
-        ert_obs_node_list.append(node_name)
-    return ert_obs_node_list
+@dataclass
+class Parameter:
+    name: str
+    type: str
+    parameters: List = field(default_factory=list)
+
+    def to_list(self):
+        if self.parameters:
+            return [f"{self.name}:{parameter}" for parameter in self.parameters]
+        else:
+            return [f"{self.name}"]
+
+    def to_dict(self):
+        return {self.name: self.parameters}
 
 
-def get_param_from_ert(ert):
-    ens_config = ert.ensembleConfig()
+@dataclass
+class Parameters:
+    parameters: List[Parameter] = field(default_factory=list)
+
+    def append(self, new):
+        self.parameters.append(new)
+
+    def to_list(self):
+        result = []
+        for parameter in self.parameters:
+            result.extend(parameter.to_list())
+        return result
+
+    def to_dict(self):
+        result = {}
+        for parameter in self.parameters:
+            if parameter.name in result:
+                raise ValueError(f"Duplicate parameters found: {parameter.name}")
+            result.update(parameter.to_dict())
+        return result
+
+    @classmethod
+    def from_list(cls, input_list):
+        result = defaultdict(list)
+        for item in input_list:
+            words = item.split(":")
+            if len(words) == 1:
+                name = words[0]
+                parameters = None
+            elif len(words) == 2:
+                name, parameters = words
+            else:
+                raise ValueError(f"Too many : in {item}")
+            if name in result:
+                if not parameters:
+                    raise ValueError(
+                        f"Inconsistent parameters, found {name} in "
+                        f"{dict(result)}, but did not find parameters"
+                    )
+                if not result[name]:
+                    raise ValueError(
+                        f"Inconsistent parameters, found {name} in {dict(result)} but "
+                        f"did not expect parameters, found {parameters}"
+                    )
+            if parameters:
+                result[name].append(parameters)
+            else:
+                result[name] = []
+        return cls([Parameter(key, "UNKNOWN", val) for key, val in result.items()])
+
+
+def get_param_from_ert(ens_config):
+    new_params = Parameters()
     keylist = ens_config.alloc_keylist()
-    parameters_for_node = {}
-    node_type = {}
     implementation_type_not_scalar = [
         ErtImplType.GEN_DATA,
         ErtImplType.FIELD,
@@ -45,17 +98,13 @@ def get_param_from_ert(ert):
     for key in keylist:
         node = ens_config.getNode(key)
         impl_type = node.getImplementationType()
-        node_type[key] = impl_type
-        var_type = node.getVariableType()
-        if var_type == EnkfVarType.PARAMETER:
+        if node.getVariableType() == EnkfVarType.PARAMETER:
+            my_param = Parameter(key, impl_type)
+            new_params.append(my_param)
             if impl_type == ErtImplType.GEN_KW:
                 # Node contains scalar parameters defined by GEN_KW
                 kw_config_model = node.getKeywordModelConfig()
-                string_list = kw_config_model.getKeyWords()
-                param_list = []
-                for name in string_list:
-                    param_list.append(name)
-                parameters_for_node[key] = param_list
+                my_param.parameters = kw_config_model.getKeyWords().strings
             elif impl_type in implementation_type_not_scalar:
                 # Node contains parameter from FIELD, SURFACE or GEN_PARAM
                 # The parameters_for_node dict contains empty list for FIELD
@@ -65,7 +114,7 @@ def get_param_from_ert(ert):
                 # The number of variables for a SURFACE parameter is
                 # defined by the size of a surface object.
                 # For GEN_PARAM the list contains the number of variables.
-                parameters_for_node[key] = []
+                # parameters_for_node[key] = []
                 if impl_type == ErtImplType.GEN_DATA:
                     gen_data_config = node.getDataModelConfig()
                     data_size = gen_data_config.get_initial_size()
@@ -82,9 +131,9 @@ def get_param_from_ert(ert):
                         f"GEN_PARAM node {key} has {data_size} parameters.",
                         LogLevel.LEVEL3,
                     )
-                    parameters_for_node[key] = [str(data_size)]
+                    my_param.parameters = [str(item) for item in range(data_size)]
 
-    return parameters_for_node, node_type
+    return new_params
 
 
 def read_localisation_config(args):
@@ -105,8 +154,6 @@ def active_index_for_parameter(node_name, param_name, ert_param_dict):
     # For parameters defined as scalar parameters (coming from GEN_KW)
     # the parameters for a node have a name. Get the index from the order
     # of these parameters.
-    # For parameters that are not coming from GEN_KW,
-    # the active index is not used here.
 
     ert_param_list = ert_param_dict[node_name]
     if len(ert_param_list) > 0:
@@ -116,8 +163,6 @@ def active_index_for_parameter(node_name, param_name, ert_param_dict):
                 index = count
                 break
         assert index > -1
-    else:
-        index = None
     return index
 
 
@@ -157,208 +202,187 @@ def activate_gen_param(model_param_group, node_name, param_list, data_size):
         active_param_list.addActiveIndex(index)
 
 
-def write_scaling_values(
+def activate_and_scale_correlation(
+    grid, method, row_scaling, ref_pos, data_size, main_range, perp_range, azimuth
+):
+
+    if method == "gaussian_decay":
+        row_scaling.assign(
+            data_size,
+            GaussianDecay(ref_pos, main_range, perp_range, azimuth, grid),
+        )
+    elif method == "exponential_decay":
+        row_scaling.assign(
+            data_size,
+            ExponentialDecay(ref_pos, main_range, perp_range, azimuth, grid),
+        )
+    else:
+        print(f" --  Scaling method: {method} " "is not implemented.")
+
+
+def get_file_with_surface_format(directory_path, file_with_surface_format):
+    # The file is either of format <name%d.suffix> or <name.suffix>
+    # since it is the name specified in the INIT_FILES sub keyword
+    # of the SURFACE keyword in ERT config file
+    if "%" in file_with_surface_format:
+        # Assume that realisation 0 exist for the init file
+        n = 0
+        words = file_with_surface_format.split("%")
+        filename = directory_path + "/" + words[0] + str(n) + words[1][1:]
+    else:
+        filename = directory_path + "/" + file_with_surface_format
+    return filename
+
+
+def apply_gaussian_decay(
+    row_scaling, data_size, grid, ref_pos, main_range, perp_range, azimuth
+):
+    row_scaling.assign(
+        data_size,
+        GaussianDecay(ref_pos, main_range, perp_range, azimuth, grid),
+    )
+
+
+def apply_exponential_decay(
+    row_scaling, data_size, grid, ref_pos, main_range, perp_range, azimuth
+):
+    row_scaling.assign(
+        data_size,
+        ExponentialDecay(ref_pos, main_range, perp_range, azimuth, grid),
+    )
+
+
+def apply_from_file(row_scaling, data_size, grid, filename, param_name):
+    debug_print(f"Read scaling factors as parameter {param_name}", LogLevel.LEVEL3)
+    debug_print(f"File name:  {filename}", LogLevel.LEVEL3)
+    with cwrap.open(filename, "r") as file:
+        scaling_parameter = Ecl3DKW.read_grdecl(
+            grid,
+            file,
+            param_name,
+            strict=True,
+            ecl_type=EclDataType.ECL_FLOAT,
+        )
+        for index in range(data_size):
+            global_index = grid.global_index(active_index=index)
+            row_scaling[index] = scaling_parameter[global_index]
+
+
+def apply_segment(
+    row_scaling,
+    data_size,
+    grid,
+    filename,
+    param_name,
+    active_segment_list,
+    scaling_factor_list,
     corr_name,
-    node_name,
-    method_name,
+    use_return_param=False,
+):
+    """
+    Purpose: Use region numbers and list of scaling factors per region to
+                   create scaling factors. Input file is region file with specified
+                   parameter name, active segment list and scaling factor list
+                   are user specified.
+    """
+    # pylint: disable=R0912
+    debug_print(f"Use parameter name: {param_name}", LogLevel.LEVEL3)
+    debug_print(f"Active segments: {active_segment_list}", LogLevel.LEVEL3)
+    if scaling_factor_list is None:
+        scaling_factor_list = []
+        scaling_factor_list.append(1.0)
+        debug_print(f"Scaling factors:    {scaling_factor_list}", LogLevel.LEVEL3)
+
+    max_region_number_specified = 0
+    for n in active_segment_list:
+        if n > max_region_number_specified:
+            max_region_number_specified = n
+        if n < 0:
+            raise ValueError("Segment number must be non-negative integer")
+
+    scaling = np.zeros(max_region_number_specified + 1, dtype=np.float32)
+    for count, n in enumerate(active_segment_list):
+        # Array to look up scaling factor given segment number
+        scaling[n] = scaling_factor_list[count]
+
+    debug_print(f"Read region file: {filename}", LogLevel.LEVEL3)
+    with cwrap.open(filename, "r") as file:
+        region_parameter = Ecl3DKW.read_grdecl(
+            grid,
+            file,
+            param_name,
+            strict=True,
+            ecl_type=EclDataType.ECL_INT,
+        )
+    # Get max region number
+    max_region_number = 0
+    for index in range(data_size):
+        global_index = grid.global_index(active_index=index)
+        region_number = region_parameter[global_index]
+        if region_number > max_region_number:
+            max_region_number = region_number
+
+    # Array with 0 if region number is not used and 1 if used
+    # Assign scaling factor and save which regions is used as info
+    region_used = np.zeros(max_region_number + 1, dtype=np.uint16)
+    param_for_field = None
+    if use_return_param:
+        param_for_field = np.zeros(data_size, dtype=np.float32)
+    for index in range(data_size):
+        global_index = grid.global_index(active_index=index)
+        region_number = region_parameter[global_index]
+        region_used[region_number] = 1
+        if region_number in active_segment_list:
+            row_scaling[index] = scaling[region_number]
+            if use_return_param:
+                param_for_field[index] = scaling[region_number]
+        else:
+            row_scaling[index] = 0
+
+    not_defined_in_region_param = []
+    for n in active_segment_list:
+        if not region_used[n]:
+            not_defined_in_region_param.append(n)
+    if len(not_defined_in_region_param) > 0:
+        debug_print(
+            f"Warning: The following region numbers are specified in \n"
+            "                config file for correlation group "
+            f"{corr_name}, \n"
+            "                but not found in region parameter: "
+            f"{not_defined_in_region_param}",
+            LogLevel.LEVEL3,
+        )
+    return param_for_field
+
+
+def add_ministeps(
+    user_config,
+    ert_param_dict,
+    ert_local_config,
+    ert_ensemble_config,
     grid_for_field,
-    ref_pos,
-    main_range,
-    perp_range,
-    azimuth,
 ):
-    # pylint: disable=W0603
-    global scaling_parameter_number
-    nx = grid_for_field.getNX()
-    ny = grid_for_field.getNY()
-    nz = grid_for_field.getNZ()
-    if method_name == "gaussian_decay":
-        decay_obj = GaussianDecay(
-            ref_pos, main_range, perp_range, azimuth, grid_for_field, None
-        )
-    elif method_name == "exponential_decay":
-        decay_obj = ExponentialDecay(
-            ref_pos, main_range, perp_range, azimuth, grid_for_field, None
-        )
-    else:
-        raise KeyError(f" Method name: {method_name} is not implemented")
-
-    scaling_values = np.zeros((nx, ny, nz), dtype=np.float32)
-    for k in range(nz):
-        for j in range(ny):
-            for i in range(nx):
-                global_index = grid_for_field.global_index(ijk=(i, j, k))
-                scaling_values[i, j, k] = decay_obj(global_index)
-
-    scaling_kw_name = "S_" + str(scaling_parameter_number)
-    scaling_kw = grid_for_field.create_kw(scaling_values, scaling_kw_name, False)
-    filename = corr_name + "_" + node_name + "_scaling" + ".GRDECL"
-    print(f"   -- Write file: {filename}")
-    with cwrap.open(filename, "w") as file:
-        grid_for_field.write_grdecl(scaling_kw, file)
-    scaling_parameter_number += 1
-
-
-def activate_and_scale_field_correlation(
-    model_param_group, node_name, field_config, corr_spec, grid_for_field
-):
-    assert corr_spec.field_scale
-    ref_pos = corr_spec.ref_point
-    check_if_ref_point_in_grid(ref_pos, grid_for_field)
-
-    # A scaling of correlation is defined
-    debug_print(
-        f"Apply the correlation scaling method: {corr_spec.field_scale.method}",
-        LogLevel.LEVEL3,
-    )
-
-    row_scaling = model_param_group.row_scaling(node_name)
-    data_size = field_config.get_data_size()
-
-    if corr_spec.field_scale.method == "gaussian_decay":
-        main_range = corr_spec.field_scale.main_range
-        perp_range = corr_spec.field_scale.perp_range
-        azimuth = corr_spec.field_scale.angle
-        row_scaling.assign(
-            data_size,
-            GaussianDecay(
-                ref_pos, main_range, perp_range, azimuth, grid_for_field, None
-            ),
-        )
-        if debug_level >= LogLevel.LEVEL4:
-            write_scaling_values(
-                corr_spec.name,
-                node_name,
-                corr_spec.field_scale.method,
-                grid_for_field,
-                ref_pos,
-                main_range,
-                perp_range,
-                azimuth,
-            )
-
-    elif corr_spec.field_scale.method == "exponential_decay":
-        main_range = corr_spec.field_scale.main_range
-        perp_range = corr_spec.field_scale.perp_range
-        azimuth = corr_spec.field_scale.angle
-        row_scaling.assign(
-            data_size,
-            ExponentialDecay(
-                ref_pos, main_range, perp_range, azimuth, grid_for_field, None
-            ),
-        )
-        if debug_level >= LogLevel.LEVEL4:
-            write_scaling_values(
-                corr_spec.name,
-                node_name,
-                corr_spec.field_scale.method,
-                grid_for_field,
-                ref_pos,
-                main_range,
-                perp_range,
-                azimuth,
-            )
-
-    else:
-        print(
-            f" --  Scaling method: {corr_spec.field_scale.method} "
-            "is not implemented."
-        )
-
-
-def activate_and_scale_surface_correlation(
-    model_param_group,
-    node_name,
-    corr_spec,
-):
-    assert corr_spec.surface_scale
-    # A scaling of correlation is defined
-    debug_print(
-        "Get surface grid attributes from file: " f"{corr_spec.surface_scale.filename}",
-        LogLevel.LEVEL2,
-    )
-    surface = Surface(corr_spec.surface_scale.filename)
-    nx = surface.getNX()
-    ny = surface.getNY()
-    data_size = nx * ny
-    debug_print(f"Surface grid size: ({nx}, {ny})", LogLevel.LEVEL3)
-    debug_print(
-        "Apply the correlation scaling method: " f"{corr_spec.surface_scale.method}\n",
-        LogLevel.LEVEL2,
-    )
-    row_scaling = model_param_group.row_scaling(node_name)
-
-    if corr_spec.surface_scale.method == "gaussian_decay":
-        assert corr_spec.ref_point
-        ref_pos = corr_spec.ref_point
-        main_range = corr_spec.surface_scale.main_range
-        perp_range = corr_spec.surface_scale.perp_range
-        azimuth = corr_spec.surface_scale.angle
-        row_scaling.assign(
-            data_size,
-            GaussianDecay(ref_pos, main_range, perp_range, azimuth, None, surface),
-        )
-    elif corr_spec.surface_scale.method == "exponential_decay":
-        assert corr_spec.ref_point
-        ref_pos = corr_spec.ref_point
-        main_range = corr_spec.surface_scale.main_range
-        perp_range = corr_spec.surface_scale.perp_range
-        azimuth = corr_spec.surface_scale.angle
-        row_scaling.assign(
-            data_size,
-            ExponentialDecay(ref_pos, main_range, perp_range, azimuth, None, surface),
-        )
-    else:
-        print(
-            f" --  Scaling method: {corr_spec.field_scale.method} "
-            "is not implemented."
-        )
-
-
-def add_ministeps(user_config, ert_param_dict, ert):
-    """
-    This is the main function setting up the localisation for an ERT instance.
-    Input:
-              user_config: Configuration object with user specified localisation setup.
-              ert_param_dict:  Dict of parameter nodes and associated parameters defined
-                                           for the ERT instance.
-              ert: The ERT instance.
-    Result:
-    The result is to add a user-specified number of ministeps to an update step.
-    Each ministep specify a set of model parameters and a set of observations
-    and that there should be correlations between them. By selecting which
-    parameters to correlate to which observations, it is possible to restrict the
-    correlations and avoid unwanted or unrealistic correlations. When this is done
-    prior to the first analysis step in ERT Ensemble Smoother algorithm, the specified
-    localisation restrictions will be used.
-    """
     # pylint: disable-msg=too-many-branches
-    local_config = ert.getLocalConfig()
-    updatestep = local_config.getUpdatestep()
-    ens_config = ert.ensembleConfig()
-    grid_for_field = ert.eclConfig().getGrid()
-    debug_print(f"Log level: {log_level_setting.debug_level}", LogLevel.LEVEL1)
+    # pylint: disable-msg=R0915
     debug_print("Add all ministeps:", LogLevel.LEVEL1)
-    if grid_for_field is not None:
-        debug_print(f"Get grid: {grid_for_field.get_name()}", LogLevel.LEVEL1)
-
+    ScalingValues.initialize()
     for count, corr_spec in enumerate(user_config.correlations):
         ministep_name = corr_spec.name
-        ministep = local_config.createMinistep(ministep_name)
+        ministep = ert_local_config.createMinistep(ministep_name)
         debug_print(f"Define ministep: {ministep_name}", LogLevel.LEVEL1)
 
         param_group_name = ministep_name + "_param_group"
-        model_param_group = local_config.createDataset(param_group_name)
+        model_param_group = ert_local_config.createDataset(param_group_name)
 
         obs_group_name = ministep_name + "_obs_group"
-        obs_group = local_config.createObsdata(obs_group_name)
+        obs_group = ert_local_config.createObsdata(obs_group_name)
 
-        obs_list = corr_spec.obs_group.add
-        param_dict = corr_spec.param_group.add
+        obs_list = corr_spec.obs_group.result_items
+        param_dict = Parameters.from_list(corr_spec.param_group.result_items).to_dict()
 
         # Setup model parameter group
         for node_name, param_list in param_dict.items():
-            node = ens_config.getNode(node_name)
+            node = ert_ensemble_config.getNode(node_name)
             impl_type = node.getImplementationType()
 
             debug_print(f"Add node: {node_name} of type: {impl_type}", LogLevel.LEVEL2)
@@ -369,15 +393,80 @@ def add_ministeps(user_config, ert_param_dict, ert):
                 )
             elif impl_type == ErtImplType.FIELD:
                 if corr_spec.field_scale is not None:
-                    field_config = node.getFieldModelConfig()
-
-                    activate_and_scale_field_correlation(
-                        model_param_group,
-                        node_name,
-                        field_config,
-                        corr_spec,
-                        grid_for_field,
+                    debug_print(
+                        "Scale correlations using method: "
+                        f"{corr_spec.field_scale.method}",
+                        LogLevel.LEVEL3,
                     )
+                    field_config = node.getFieldModelConfig()
+                    row_scaling = model_param_group.row_scaling(node_name)
+                    data_size = grid_for_field.get_num_active()
+                    data_size2 = field_config.get_data_size()
+                    assert data_size == data_size2
+                    param_for_field = None
+                    if corr_spec.field_scale.method == "gaussian_decay":
+                        ref_pos = corr_spec.ref_point
+                        main_range = corr_spec.field_scale.main_range
+                        perp_range = corr_spec.field_scale.perp_range
+                        azimuth = corr_spec.field_scale.azimuth
+                        check_if_ref_point_in_grid(ref_pos, grid_for_field)
+                        apply_gaussian_decay(
+                            row_scaling,
+                            data_size,
+                            grid_for_field,
+                            ref_pos,
+                            main_range,
+                            perp_range,
+                            azimuth,
+                        )
+
+                    elif corr_spec.field_scale.method == "exponential_decay":
+                        ref_pos = corr_spec.ref_point
+                        main_range = corr_spec.field_scale.main_range
+                        perp_range = corr_spec.field_scale.perp_range
+                        azimuth = corr_spec.field_scale.azimuth
+                        check_if_ref_point_in_grid(ref_pos, grid_for_field)
+                        apply_exponential_decay(
+                            row_scaling,
+                            data_size,
+                            grid_for_field,
+                            ref_pos,
+                            main_range,
+                            perp_range,
+                            azimuth,
+                        )
+
+                    elif corr_spec.field_scale.method == "from_file":
+                        apply_from_file(
+                            row_scaling,
+                            data_size,
+                            grid_for_field,
+                            corr_spec.field_scale.filename,
+                            corr_spec.field_scale.param_name,
+                        )
+
+                    elif corr_spec.field_scale.method == "segment":
+                        param_for_field = apply_segment(
+                            row_scaling,
+                            data_size,
+                            grid_for_field,
+                            corr_spec.field_scale.segment_filename,
+                            corr_spec.field_scale.param_name,
+                            corr_spec.field_scale.active_segments,
+                            corr_spec.field_scale.scalingfactors,
+                            corr_spec.name,
+                            user_config.write_scaling_factors,
+                        )
+                    else:
+                        print(
+                            f" --  Scaling method: {corr_spec.field_scale.method} "
+                            "is not implemented."
+                        )
+
+                    if user_config.write_scaling_factors:
+                        ScalingValues.write(
+                            node_name, corr_spec, grid_for_field, param_for_field
+                        )
                 else:
                     debug_print(
                         f"No correlation scaling for node {node_name} "
@@ -399,11 +488,46 @@ def add_ministeps(user_config, ert_param_dict, ert):
                     )
             elif impl_type == ErtImplType.SURFACE:
                 if corr_spec.surface_scale is not None:
-                    activate_and_scale_surface_correlation(
-                        model_param_group,
-                        node_name,
-                        corr_spec,
+                    surface_directory_path = corr_spec.surface_scale.surface_directory
+                    file_with_surface_format = get_file_with_surface_format(
+                        surface_directory_path, node.get_init_file_fmt()
                     )
+                    debug_print(
+                        f"Get surface size from: {file_with_surface_format}",
+                        LogLevel.LEVEL3,
+                    )
+                    surface = Surface(file_with_surface_format)
+                    data_size = surface.getNX() * surface.getNY()
+                    row_scaling = model_param_group.row_scaling(node_name)
+                    if corr_spec.surface_scale.method == "gaussian_decay":
+                        ref_pos = corr_spec.ref_point
+                        main_range = corr_spec.surface_scale.main_range
+                        perp_range = corr_spec.surface_scale.perp_range
+                        azimuth = corr_spec.surface_scale.azimuth
+                        apply_gaussian_decay(
+                            row_scaling,
+                            data_size,
+                            surface,
+                            ref_pos,
+                            main_range,
+                            perp_range,
+                            azimuth,
+                        )
+
+                    elif corr_spec.field_scale.method == "exponential_decay":
+                        ref_pos = corr_spec.ref_point
+                        main_range = corr_spec.surface_scale.main_range
+                        perp_range = corr_spec.surface_scale.perp_range
+                        azimuth = corr_spec.surface_scale.azimuth
+                        apply_exponential_decay(
+                            row_scaling,
+                            data_size,
+                            surface,
+                            ref_pos,
+                            main_range,
+                            perp_range,
+                            azimuth,
+                        )
                 else:
                     debug_print(
                         f"No correlation scaling for node {node_name} "
@@ -428,7 +552,7 @@ def add_ministeps(user_config, ert_param_dict, ert):
         ministep.attachObsset(obs_group)
 
         debug_print(f"Add {ministep_name} to update step\n", LogLevel.LEVEL1)
-        updatestep.attachMinistep(ministep)
+        ert_local_config.getUpdatestep().attachMinistep(ministep)
 
 
 def clear_correlations(ert):
@@ -438,13 +562,13 @@ def clear_correlations(ert):
 
 def check_if_ref_point_in_grid(ref_point, grid):
     try:
-        i, j = grid.find_cell_xy(ref_point[0], ref_point[1], 0)
-    except ValueError:
+        grid.find_cell_xy(ref_point[0], ref_point[1], 0)
+    except ValueError as err:
         raise ValueError(
             f"Reference point {ref_point} corresponds to undefined grid cell "
             f"or is outside the area defined by the grid {grid.get_name()}\n"
             "Check specification of reference point."
-        ) from None
+        ) from err
 
 
 # This is an example callable which decays as a gaussian away from a position
@@ -454,8 +578,7 @@ class Decay:
     main_range: float
     perp_range: float
     azimuth: float
-    grid3D: object
-    grid2D: object
+    grid: object
 
     def __post_init__(self):
         angle = (90.0 - self.azimuth) * math.pi / 180.0
@@ -463,10 +586,10 @@ class Decay:
         self.sinangle = math.sin(angle)
 
     def get_dx_dy(self, data_index):
-        if self.grid3D is not None:
-            x, y, _ = self.grid3D.get_xyz(active_index=data_index)
-        elif self.grid2D is not None:
-            x, y = self.grid2D.getXY(data_index)
+        try:
+            x, y, _ = self.grid.get_xyz(active_index=data_index)
+        except AttributeError:
+            x, y = self.grid.getXY(data_index)
         x_unrotated = x - self.obs_pos[0]
         y_unrotated = y - self.obs_pos[1]
 
@@ -491,3 +614,79 @@ class ExponentialDecay(Decay):
         dx, dy = super().get_dx_dy(data_index)
         exp_arg = -0.5 * math.sqrt(dx * dx + dy * dy)
         return math.exp(exp_arg)
+
+
+class ScalingValues:
+    # pylint: disable=R0903
+    scaling_param_number = 1
+    corr_name = None
+
+    @classmethod
+    def initialize(cls):
+        cls.scaling_param_number = 1
+        cls.corr_name = None
+
+    @classmethod
+    def write(cls, node_name, corr_spec, grid_for_field, param_for_field=None):
+        corr_name = corr_spec.name
+        ref_point = corr_spec.ref_point
+        grid = grid_for_field
+        if corr_spec.field_scale is None:
+            raise ValueError(
+                "Scaling values for 3D parameters require "
+                f"specification of keyword 'field_scale' for {cls.corr_name}"
+            )
+        method_name = corr_spec.field_scale.method
+
+        if method_name == "gaussian_decay":
+            decay_obj = GaussianDecay(
+                ref_point,
+                corr_spec.field_scale.main_range,
+                corr_spec.field_scale.perp_range,
+                corr_spec.field_scale.azimuth,
+                grid,
+            )
+            scaling_values = cls._calculate_scaling_param_decay(grid, decay_obj)
+        elif method_name == "exponential_decay":
+            decay_obj = ExponentialDecay(
+                ref_point,
+                corr_spec.field_scale.main_range,
+                corr_spec.field_scale.perp_range,
+                corr_spec.field_scale.azimuth,
+                grid,
+            )
+            scaling_values = cls._calculate_scaling_param_decay(grid, decay_obj)
+        elif method_name == "segment":
+            if param_for_field is not None:
+                scaling_values = param_for_field
+            else:
+                raise ValueError("Can not write undefined parameter")
+        else:
+            raise KeyError(f" Method name: {method_name} is not implemented")
+
+        # Write scaling parameter  once per corr_name
+        if corr_name != cls.corr_name:
+            cls.corr_name = corr_name
+            scaling_kw_name = "S_" + str(cls.scaling_param_number)
+            scaling_kw = grid.create_kw(scaling_values, scaling_kw_name, False)
+            filename = (
+                cls.corr_name + "_" + node_name + "_" + scaling_kw_name + ".GRDECL"
+            )
+            debug_print(f"Write file: {filename}", LogLevel.LEVEL3)
+            with cwrap.open(filename, "w") as file:
+                grid.write_grdecl(scaling_kw, file)
+            # Increase parameter number to define unique parameter name
+            cls.scaling_param_number = cls.scaling_param_number + 1
+
+    @classmethod
+    def _calculate_scaling_param_decay(cls, grid, decay_obj):
+        nx = grid.getNX()
+        ny = grid.getNY()
+        nz = grid.getNZ()
+        scaling_values = np.zeros((nx, ny, nz), dtype=np.float32)
+        for k in range(nz):
+            for j in range(ny):
+                for i in range(nx):
+                    global_index = grid.global_index(ijk=(i, j, k))
+                    scaling_values[i, j, k] = decay_obj(global_index)
+        return scaling_values
