@@ -1,0 +1,12 @@
+Source code scripts:
+
+sim_fields.py  - This script is run from ERT config file as a FORWARD model.
+FM_SIM_FIELD  - ERT configuration of forward model SIM_FIELD
+                             using the above mentioned script.
+
+Scripts used in RMS project to load and visualize the realizations.
+These are not needed to run the test and alternatives for visualizing the realizations exists (coviz, webviz?):
+import_field_parameters.py
+import_field_parameters_local.py
+import_upscaled_field_parameters_local.py
+import_upscaled_field_parameters.py

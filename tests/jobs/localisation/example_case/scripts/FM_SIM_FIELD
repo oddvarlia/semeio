@@ -1,0 +1,6 @@
+EXECUTABLE  ./sim_fields.py
+
+ARGLIST <ITERATION> <REALNUMBER>
+
+STDERR  sim_fields.stderr
+STDOUT  sim_fields.stdout
